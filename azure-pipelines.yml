@@ -1,0 +1,241 @@
+trigger: none
+
+pool: Azure Pipelines
+
+stages:
+  - stage: TerraformFoundation
+    displayName: Terraform Foundation
+    jobs:
+      - job: TerraformInstallFmt
+        displayName: terraform install & fmt
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: 'latest'
+          - task: TerraformTask@5
+            displayName: terraform fmt
+            inputs:
+              provider: 'azurerm'
+              command: 'custom'
+              outputTo: 'console'
+              customCommand: 'fmt'
+              environmentServiceNameAzureRM: 'redo_ADO'
+
+          - task: TerraformTask@5
+            displayName: terraform validate
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+
+  - stage: TerraformLint
+    displayName: Terraform Lint
+    jobs:
+      - job: TerraformLint
+        displayName: Lint
+        steps:
+          - task: PowerShell@2
+            displayName: terraform init
+            inputs:
+              targetType: 'inline'
+              script: |
+                $ErrorActionPreference = "Stop"
+                
+                        $version = "$(TFLINT_VERSION)"
+                        $zipUrl  = "https://github.com/terraform-linters/tflint/releases/download/$version/tflint_windows_amd64.zip"
+                        $zipPath = "$(Agent.TempDirectory)\tflint.zip"
+                        $outDir  = "$(Agent.TempDirectory)\tflint"
+                
+                        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
+                        if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force }
+                        New-Item -ItemType Directory -Path $outDir | Out-Null
+                        Expand-Archive -Path $zipPath -DestinationPath $outDir -Force
+                
+                        Write-Host "##vso[task.prependpath]$outDir"
+                        tflint --version
+          - task: PowerShell@2
+            displayName: tflint
+            inputs:
+              targetType: 'inline'
+              script: |
+                tflint --init
+                tflint -recursive -out=tflint
+
+  - stage: SecurityScan
+    displayName: Security Scan
+    jobs:
+      - job: InfraSecurityScan
+        displayName: Infrastructure Scanning
+        steps:
+          - task: tfsec@1
+            displayName: tfsec
+            inputs:
+              version: 'v1.26.0'
+              dir: '${System.DefaultWorkingDirectory}'
+              commandOptions: '-out=tfsec'
+
+          - task: PowerShell@2
+            displayName: CheckOv Scan
+            inputs:
+              targetType: 'inline'
+              script: |
+                $ErrorActionPreference = "Stop"
+                
+                python -m pip install --quiet --upgrade checkov
+                
+                checkov -d infra -out=checkovScan
+            
+  - stage: TerraformPlan
+    displayName: Terraform Plan
+    jobs:
+      - job: TerraformPlan
+        displayName: terraform plan
+        steps:
+        - task: TerraformTask@5
+          displayName: terraform init
+          inputs:
+            provider: 'azurerm'
+            command: 'init'
+            backendServiceArm: 'redo_ADO'
+            backendAzureRmStorageAccountName: 'stg'
+            backendAzureRmContainerName: 'cont'
+            backendAzureRmKey: 'state'
+
+        - task: TerraformTask@5
+          displayName: Terraform Plan
+          inputs:
+            provider: 'azurerm'
+            command: 'plan'
+            environmentServiceNameAzureRM: 'redo_ADO'
+            commandOptions: '-out=tfplan'
+        - task: PublishPipelineArtifact@1
+          displayName: Publish Plan Output
+          inputs:
+            targetPath: '$(Pipeline.Workspace)'
+            artifact: 'tfplan'
+            publishLocation: 'pipeline'
+        - task: PowerShell@2
+          displayName: "Create tfplan.json"
+          inputs:
+            targetType: "inline"
+            script: |
+              terraform show -json tfplan > tfplan.json
+  
+  - stage: PreApplyInfraTests
+    displayName: Pre-Apply Infra-Tests
+    jobs:
+      - job: RunTerratest
+        displayName: RunTerratest
+        steps:
+          - task: GoTool@0
+            displayName: Setup Go
+            inputs:
+              version: '1.10'
+          - task: PowerShell@2
+            displayName: Run Terratest
+            inputs:
+              targetType: 'inline'
+              script: |
+                cd tests
+                        go mod download
+                        go test -v -timeout 60m ./...
+
+  - stage: PreApplyPolicyTests
+    displayName: Pre-Apply Policy Tests
+    jobs:
+      - job: ConftestPolicyGate
+        displayName: Conftest Policy Gate
+        steps:
+          - task: PowerShell@2
+            displayName: Conftest Policy Gate
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -e
+                
+                      # Install conftest (Linux)
+                      wget -qO- https://github.com/open-policy-agent/conftest/releases/latest/download/conftest_0.56.0_Linux_x86_64.tar.gz \
+                        | tar xz conftest
+                      sudo mv conftest /usr/local/bin/conftest
+                
+                      conftest --version
+                
+                      # Gate: fail pipeline if any denies
+                      conftest test tfplan.json -p policy/ --all-namespaces
+
+  - stage: CostEstimation
+    displayName: Cost Estimation
+    jobs:
+      - job: Infracost
+        displayName: Infracost Cost Estimate
+        steps:
+          - task: PowerShell@2
+            displayName: Infracost Cost Estimate
+            inputs:
+              targetType: 'inline'
+              script: |
+                $ErrorActionPreference = "Stop"
+                
+                # Install Infracost CLI (Linux agent is simplest; if Windows agent, tell me and I’ll adjust)
+                curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+                sudo mv infracost-linux-amd64 /usr/local/bin/infracost
+          
+                infracost --version
+          
+                # Breakdown from plan JSON
+                infracost breakdown --path plan.json --format json --out-file infracost.json
+          - task: PowerShell@2
+            displayName: Cost gate
+            inputs:
+              targetType: 'inline'
+              script: |
+                $ErrorActionPreference = "Stop"
+                
+                      $data = Get-Content infracost.json | ConvertFrom-Json
+                      # Infracost JSON includes totalMonthlyCost, pastTotalMonthlyCost, diffTotalMonthlyCost
+                      $diff = [decimal]$data.diffTotalMonthlyCost
+                
+                      Write-Host "Monthly cost diff: $diff"
+                
+                      if ($diff -gt 50) {
+                        Write-Error "Cost increase is > $50/month. Failing pipeline."
+                    }
+          - task: PublishPipelineArtifact@1
+            displayName: Publish Infracost Report
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/infracost.json'
+              artifact: 'infracost'
+              publishLocation: 'pipeline'
+
+  - stage: ApprovalGate
+    displayName: Approval Gate
+    pool: server
+    jobs:
+      - job: ManualValidation
+        displayName: Manual Validation
+        steps:
+          - task: ManualValidation@1
+            displayName: Manual Validation
+            inputs:
+              notifyUsers: 'devopscollab101@gmail.com'
+              approvers: 'devopscollab101@gmail.com'
+
+  - stage: TerraformApply
+    displayName: Terraform Apply
+    jobs:
+      - job: TerraformApply
+        displayName: Terraform Apply
+        steps:
+          - task: TerraformTask@5
+            displayName: Terraform Initialise
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: 'redo_ADO'
+              backendAzureRmStorageAccountName: 'stg'
+              backendAzureRmContainerName: 'cont'
+              backendAzureRmKey: 'state'
+          - task: PowerShell@2
+            displayName: Terraform Apply
+            inputs:
+              targetType: 'inline'
+              script: 'terraform apply --plan.json'

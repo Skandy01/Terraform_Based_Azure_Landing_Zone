@@ -1,0 +1,13 @@
+variable "vm_name" {}
+variable "RG_name" {}
+variable "location" {}
+variable "vm_size" {}
+variable "admin_username" {}
+variable "admin_password" {}
+variable "nic_id" {}
+variable "os_disk_caching" {}
+variable "storage_account_type" {}
+variable "image_publisher" {}
+variable "image_offer" {}
+variable "image_sku" {}
+variable "image_version" {}
