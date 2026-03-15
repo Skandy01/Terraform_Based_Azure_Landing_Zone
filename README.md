@@ -138,5 +138,5 @@ NSGs restrict traffic at subnet and NIC levels
 
 👤 Author
 
-Bhabya Bharti
+Skand
 DevOps Engineer | Azure | Terraform | CI/CD | Platform Engineering
